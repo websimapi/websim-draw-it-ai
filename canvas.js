@@ -1,15 +1,16 @@
 export class DrawingCanvas {
-    constructor() {
+    constructor(requestUpdateCallback) {
         this.canvas = null;
         this.ctx = null;
         this.drawing = false;
         this.lastPos = { x: 0, y: 0 };
         this.colors = ['#000000', '#dc3545', '#fd7e14', '#ffc107', '#198754', '#0d6efd', '#6f42c1'];
         this.activeColor = '#000000';
+        this.requestUpdate = requestUpdateCallback || (() => {});
     }
 
     setCanvas(canvasElement) {
-        if (!canvasElement) return;
+        if (!canvasElement || this.canvas === canvasElement) return;
         this.canvas = canvasElement;
         this.ctx = this.canvas.getContext('2d');
         this.ctx.lineCap = 'round';
@@ -83,7 +84,7 @@ export class DrawingCanvas {
         this.activeColor = color;
         this.ctx.strokeStyle = this.activeColor;
         // Trigger a re-render in the Lit component
-        document.querySelector('draw-it-app').requestUpdate();
+        this.requestUpdate();
     }
     
     clear() {
@@ -94,4 +95,3 @@ export class DrawingCanvas {
         return this.canvas.toDataURL('image/png');
     }
 }
-

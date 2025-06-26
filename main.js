@@ -1,116 +1,108 @@
 import { LitElement, html, css } from 'lit';
 import { classMap } from 'lit/directives/class-map.js';
 import { v4 as uuidv4 } from 'uuid';
-import { lobby } from './network.js';
+import { lobby, room } from './network.js';
 import { DrawingCanvas } from './canvas.js';
 
 class DrawItApp extends LitElement {
     static properties = {
         gameState: { type: Object, state: true },
         player: { type: Object, state: true },
-        groups: { type: Array, state: true },
-        currentGroup: { type: Object, state: true },
+        groups: { type: Object, state: true },
+        currentGroupId: { type: String, state: true },
         error: { type: String, state: true },
         isLoading: { type: Boolean, state: true },
+        peers: { type: Object, state: true },
     };
 
     constructor() {
         super();
-        this.player = { id: uuidv4(), name: '' };
-        this.groups = [];
-        this.currentGroup = null;
+        this.player = {};
+        this.groups = {};
+        this.currentGroupId = null;
         this.error = '';
         this.isLoading = false;
         this.gameState = {};
-        this.drawingCanvas = new DrawingCanvas();
+        this.peers = {};
+        this.drawingCanvas = new DrawingCanvas(() => this.requestUpdate());
 
-        window.addEventListener('groups-update', this.handleGroupsUpdate);
-        window.addEventListener('group-update', this.handleGroupUpdate);
-        window.addEventListener('game-state-update', this.handleGameStateUpdate);
-        window.addEventListener('error', (e) => this.error = e.detail.message);
+        lobby.init(() => {
+            this.isLoading = false;
+            const myPresence = room.presence[room.clientId];
+            this.currentGroupId = myPresence?.groupId || null;
+            
+            this.groups = room.roomState.groups || {};
+            this.peers = room.peers;
+
+            if (this.currentGroupId && this.groups[this.currentGroupId]) {
+                this.gameState = this.groups[this.currentGroupId].gameState;
+            } else {
+                this.gameState = {};
+            }
+            this.requestUpdate();
+        });
     }
 
     connectedCallback() {
         super.connectedCallback();
-        lobby.getGroups();
+        // The WebsimSocket will handle disconnection logic internally.
+        // Leaving the group on unload is a good practice if desired.
+        if (this.currentGroupId) {
+            lobby.leaveGroup();
+        }
     }
 
     disconnectedCallback() {
         super.disconnectedCallback();
-        window.removeEventListener('groups-update', this.handleGroupsUpdate);
-        window.removeEventListener('group-update', this.handleGroupUpdate);
-        window.removeEventListener('game-state-update', this.handleGameStateUpdate);
-        if (this.currentGroup) {
-            lobby.leaveGroup(this.currentGroup.id, this.player);
+        // The WebsimSocket will handle disconnection logic internally.
+        // Leaving the group on unload is a good practice if desired.
+        if (this.currentGroupId) {
+            lobby.leaveGroup();
         }
     }
 
-    handleGroupsUpdate = (e) => this.groups = e.detail;
-    handleGroupUpdate = (e) => this.currentGroup = e.detail;
-    handleGameStateUpdate = (e) => {
-        this.gameState = e.detail;
-        this.isLoading = false;
-        this.requestUpdate();
-    }
-    
-    _handleNameInput = (e) => this.player.name = e.target.value;
-
     _createGroup = () => {
-        if (!this.player.name) { this.error = "Please enter a name."; return; }
         this.error = '';
-        lobby.createGroup(this.player);
+        lobby.createGroup();
     }
 
     _joinGroup = (groupId) => {
-        if (!this.player.name) { this.error = "Please enter a name before joining."; return; }
         this.error = '';
-        lobby.joinGroup(groupId, this.player);
+        lobby.joinGroup(groupId);
     }
 
     _startGame = async () => {
         this.isLoading = true;
         this.error = '';
         try {
-            const playerCount = this.currentGroup.players.length;
-            const completion = await websim.chat.completions.create({
-                messages: [{
-                    role: 'system',
-                    content: `Generate a list of ${playerCount} unique, simple, and drawable concepts for a Pictionary-style game. The concepts should be SFW and recognizable by most people. Respond ONLY with a JSON object in the format: {"prompts": ["concept 1", "concept 2", ...]}.`
-                }, {
-                    role: 'user',
-                    content: `Number of players: ${playerCount}`
-                }],
-                json: true
-            });
-            const { prompts } = JSON.parse(completion.content);
-            if (!prompts || prompts.length < playerCount) throw new Error("AI did not return enough prompts.");
-            lobby.startGame(this.currentGroup.id, prompts);
+            await lobby.startGame(this.currentGroupId);
         } catch (err) {
             console.error(err);
             this.error = "Failed to generate prompts from AI. Please try again.";
+        } finally {
             this.isLoading = false;
         }
     }
 
     _submitDrawing = () => {
         const drawing = this.drawingCanvas.toDataURL();
-        lobby.submitDrawing(this.currentGroup.id, this.player.id, drawing);
+        lobby.submitDrawing(drawing);
     }
     
     _submitGuess = (e) => {
         e.preventDefault();
         const input = this.shadowRoot.getElementById('guessInput');
         if (!input.value) return;
-        lobby.submitGuess(this.currentGroup.id, this.player.id, input.value);
+        lobby.submitGuess(input.value);
         input.value = '';
     }
 
     _nextDrawing = () => {
-        lobby.nextDrawing(this.currentGroup.id);
+        lobby.nextDrawing(this.currentGroupId);
     }
 
     _resetGame = () => {
-        lobby.resetGame(this.currentGroup.id);
+        lobby.resetGame(this.currentGroupId);
     }
     
     firstUpdated() {
@@ -121,16 +113,31 @@ class DrawItApp extends LitElement {
     }
 
     updated(changedProperties) {
+        // When the game state changes, ensure the canvas is ready
         if (changedProperties.has('gameState')) {
             const canvasEl = this.shadowRoot.getElementById('drawing-canvas');
             if (canvasEl) {
                 this.drawingCanvas.setCanvas(canvasEl);
-                this.drawingCanvas.clear();
+                if(this.gameState.phase !== 'drawing') {
+                     this.drawingCanvas.clear();
+                }
             }
         }
     }
 
     render() {
+        if (!room.clientId) {
+            return html`
+                <div id="spinner">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Connecting...</span>
+                    </div>
+                </div>
+            `;
+        }
+
+        const currentGroup = this.currentGroupId ? this.groups[this.currentGroupId] : null;
+
         return html`
             ${this.isLoading ? html`
                 <div id="spinner">
@@ -141,32 +148,39 @@ class DrawItApp extends LitElement {
 
             <div class="py-3">
                 ${this.error ? html`<div class="alert alert-danger">${this.error}</div>` : ''}
-                ${!this.currentGroup ? this.renderLobby() : this.renderGame()}
+                ${!currentGroup ? this.renderLobby() : this.renderGame(currentGroup)}
             </div>
         `;
     }
 
     renderLobby() {
+        const myInfo = this.peers[room.clientId];
         return html`
             <div class="row justify-content-center">
                 <div class="col-md-8 col-lg-6">
                     <div class="card text-center">
                         <div class="card-body">
                             <h1 class="card-title">Draw It <span class="text-primary">AI</span></h1>
-                            <p class="card-text">Enter your name, then create a group or join an existing one.</p>
-                            <div class="mb-3">
-                                <input type="text" class="form-control" placeholder="Your Name" .value=${this.player.name} @input=${this._handleNameInput}>
-                            </div>
+                             <p class="card-text">
+                                Welcome, <img src="${myInfo?.avatarUrl}" class="player-avatar" style="width:24px;height:24px;vertical-align:middle;"> <strong>${myInfo?.username}</strong>!
+                            </p>
+                            <p class="card-text">Create a group or join an existing one.</p>
                             <button class="btn btn-primary w-100 mb-3" @click=${this._createGroup}>Create New Group</button>
                             
                             <h2 class="h5 mt-4">Join a Group</h2>
                             <div class="list-group">
-                                ${this.groups.length === 0 ? html`<p class="text-muted">No active groups. Create one!</p>` : ''}
-                                ${this.groups.map(group => html`
-                                    <button type="button" class="list-group-item list-group-item-action" @click=${() => this._joinGroup(group.id)}>
-                                        ${group.host.name}'s Group (${group.players.length} players)
+                                ${Object.keys(this.groups).length === 0 ? html`<p class="text-muted">No active groups. Create one!</p>` : ''}
+                                ${Object.values(this.groups).map(group => {
+                                    const hostInfo = this.peers[group.hostId];
+                                    return html`
+                                    <button type="button" class="list-group-item list-group-item-action d-flex justify-content-between align-items-center" @click=${() => this._joinGroup(group.id)}>
+                                        <span>
+                                            <img src="${hostInfo?.avatarUrl}" class="player-avatar">
+                                            ${hostInfo?.username}'s Group
+                                        </span>
+                                        <span class="badge bg-primary rounded-pill">${Object.keys(group.playerIds).length} players</span>
                                     </button>
-                                `)}
+                                `})}
                             </div>
                         </div>
                     </div>
@@ -175,33 +189,38 @@ class DrawItApp extends LitElement {
         `;
     }
 
-    renderGame() {
+    renderGame(currentGroup) {
         switch(this.gameState.phase) {
-            case 'drawing': return this.renderDrawingPhase();
-            case 'guessing': return this.renderGuessingPhase();
-            case 'reveal': return this.renderRevealPhase();
-            default: return this.renderWaitingRoom();
+            case 'drawing': return this.renderDrawingPhase(currentGroup);
+            case 'guessing': return this.renderGuessingPhase(currentGroup);
+            case 'reveal': return this.renderRevealPhase(currentGroup);
+            default: return this.renderWaitingRoom(currentGroup);
         }
     }
 
-    renderWaitingRoom() {
-        const isHost = this.currentGroup.host.id === this.player.id;
+    renderWaitingRoom(currentGroup) {
+        const isHost = currentGroup.hostId === room.clientId;
+        const hostInfo = this.peers[currentGroup.hostId];
         return html`
             <div class="row justify-content-center">
                 <div class="col-md-8 col-lg-6">
                     <div class="card">
                         <div class="card-header">
                             <h2 class="h4 mb-0">Waiting Room</h2>
-                            <p class="mb-0 text-muted">Host: ${this.currentGroup.host.name}</p>
+                            <p class="mb-0 text-muted">Host: ${hostInfo?.username}</p>
                         </div>
                         <div class="card-body">
                             <h3 class="h5">Players:</h3>
                             <ul class="list-group">
-                                ${this.currentGroup.players.map(p => html`<li class="list-group-item">${p.name} ${p.id === this.player.id ? '(You)' : ''}</li>`)}
+                                ${Object.keys(currentGroup.playerIds).map(pid => this.peers[pid]).filter(Boolean).map(p => html`
+                                <li class="list-group-item d-flex align-items-center">
+                                    <img src="${p.avatarUrl}" class="player-avatar">
+                                    ${p.username} ${p.id === room.clientId ? '(You)' : ''}
+                                </li>`)}
                             </ul>
                         </div>
                         <div class="card-footer">
-                           ${isHost ? html`<button class="btn btn-success w-100" @click=${this._startGame} ?disabled=${this.currentGroup.players.length < 1}>Start Game</button>`
+                           ${isHost ? html`<button class="btn btn-success w-100" @click=${this._startGame} ?disabled=${Object.keys(currentGroup.playerIds).length < 1}>Start Game</button>`
                                    : html`<p class="text-center text-muted mb-0">Waiting for host to start the game...</p>`}
                         </div>
                     </div>
@@ -210,8 +229,8 @@ class DrawItApp extends LitElement {
         `;
     }
     
-    renderDrawingPhase() {
-        const myPrompt = this.gameState.prompts[this.player.id];
+    renderDrawingPhase(currentGroup) {
+        const myPrompt = this.gameState.prompts[room.clientId];
         return html`
             <div class="row justify-content-center">
                 <div class="col-12 col-md-10 col-lg-8 text-center">
@@ -234,7 +253,7 @@ class DrawItApp extends LitElement {
                             </div>
                         </div>
                         <div class="card-footer">
-                           ${this.gameState.drawings[this.player.id]
+                           ${this.gameState.drawings[room.clientId]
                                 ? html`<p class="text-success fw-bold">Drawing submitted! Waiting for others...</p>`
                                 : html`<button class="btn btn-primary w-100" @click=${this._submitDrawing}>Submit Drawing</button>`
                             }
@@ -245,18 +264,19 @@ class DrawItApp extends LitElement {
         `;
     }
 
-    renderGuessingPhase() {
+    renderGuessingPhase(currentGroup) {
         const currentDrawingPlayerId = this.gameState.drawingOrder[this.gameState.currentDrawingIndex];
         const drawingData = this.gameState.drawings[currentDrawingPlayerId];
-        const isMyDrawing = currentDrawingPlayerId === this.player.id;
-        const haveIGuessed = this.gameState.guesses[this.player.id];
+        const isMyDrawing = currentDrawingPlayerId === room.clientId;
+        const haveIGuessed = this.gameState.guesses[room.clientId];
+        const drawingPlayerInfo = this.peers[currentDrawingPlayerId];
 
         return html`
             <div class="row justify-content-center">
                 <div class="col-12 col-md-10 col-lg-8 text-center">
                     <div class="card">
                          <div class="card-header">
-                            <h2 class="h4">Guess the drawing!</h2>
+                            <h2 class="h4">Guess ${drawingPlayerInfo?.username}'s drawing!</h2>
                         </div>
                         <div class="card-body">
                             <img src=${drawingData} class="player-drawing img-fluid" alt="Player's drawing">
@@ -275,7 +295,7 @@ class DrawItApp extends LitElement {
                             }
                         </div>
                          <div class="card-footer text-muted">
-                            ${Object.values(this.gameState.guesses).filter(Boolean).length} / ${this.currentGroup.players.length - 1} guesses received.
+                            ${Object.values(this.gameState.guesses).filter(Boolean).length} / ${Object.keys(currentGroup.playerIds).length - 1} guesses received.
                         </div>
                     </div>
                 </div>
@@ -283,15 +303,18 @@ class DrawItApp extends LitElement {
         `;
     }
 
-    renderRevealPhase() {
+    renderRevealPhase(currentGroup) {
         const currentDrawingPlayerId = this.gameState.drawingOrder[this.gameState.currentDrawingIndex];
         const drawingData = this.gameState.drawings[currentDrawingPlayerId];
         const correctAnswer = this.gameState.prompts[currentDrawingPlayerId];
-        const playerGuesses = this.currentGroup.players
-            .filter(p => p.id !== currentDrawingPlayerId)
-            .map(p => ({ name: p.name, guess: this.gameState.guesses[p.id] || 'No guess' }));
+        const playerGuesses = Object.keys(currentGroup.playerIds)
+            .filter(pid => pid !== currentDrawingPlayerId)
+            .map(pid => {
+                const peer = this.peers[pid];
+                return { name: peer?.username, avatarUrl: peer?.avatarUrl, guess: this.gameState.guesses[pid] || 'No guess' };
+            });
         
-        const isHost = this.currentGroup.host.id === this.player.id;
+        const isHost = currentGroup.hostId === room.clientId;
 
         return html`
             <div class="row justify-content-center">
@@ -307,8 +330,9 @@ class DrawItApp extends LitElement {
                             <h3 class="h5">Guesses:</h3>
                              <div class="list-group text-start">
                                 ${playerGuesses.map(item => html`
-                                    <div class="list-group-item">
-                                        <strong>${item.name}:</strong> ${item.guess}
+                                    <div class="list-group-item d-flex align-items-center">
+                                        <img src="${item.avatarUrl}" class="player-avatar" />
+                                        <strong>${item.name}:</strong> <span class="ms-2">${item.guess}</span>
                                     </div>
                                 `)}
                             </div>
@@ -335,4 +359,3 @@ customElements.define('draw-it-app', DrawItApp);
 // Mount the app
 const appRoot = document.getElementById('app');
 appRoot.innerHTML = '<draw-it-app></draw-it-app>';
-
